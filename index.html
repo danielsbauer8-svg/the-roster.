@@ -2884,6 +2884,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
      On a normal website (no claude.ai capabilities) rooms run peer to peer through PeerJS.
      The room creator's browser hosts the room's data; everyone else connects to it directly.
      It mimics the small slice of the db interface the room code uses, so the game logic is shared. */
+  var BUILD_ID = '2026-10-12-5';
   var MQTT_ROOT = 'theroster/v2/';
   var MQTT_BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
   var MQTT_SRCS = ['https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js', 'https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js'];
@@ -2943,7 +2944,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     function showDiag() {
       var el = document.getElementById('net-diag'); if (!el) return;
       var rel = Object.keys(diag.relays).map(function (u) { return u.replace(/^wss:\/\/(broker\.)?/, '').replace(/[:/].*$/, '') + ' ' + diag.relays[u]; }).join(', ') || 'none yet';
-      el.textContent = 'Relay check · library: ' + diag.lib + ' · relays: ' + rel + ' · messages in: ' + diag.msgs + ' (room ' + diag.roomMsgs + ', sync ' + diag.syncs + ', unreadable ' + diag.bad + ') · sent: ' + diag.sent + (diag.errs.length ? ' · last error: ' + diag.errs[diag.errs.length - 1] : '');
+      el.textContent = 'Relay check · version ' + BUILD_ID + ' · library: ' + diag.lib + ' · relays: ' + rel + ' · messages in: ' + diag.msgs + ' (room ' + diag.roomMsgs + ', sync ' + diag.syncs + ', unreadable ' + diag.bad + ') · sent: ' + diag.sent + (diag.errs.length ? ' · last error: ' + diag.errs[diag.errs.length - 1] : '');
     }
     S.env.showDiag = showDiag;
     function loadLib() {
@@ -3220,6 +3221,20 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1000);
   }
 
+  /* GitHub Pages and phones can keep an old copy for a while; if a newer build is live, switch to it. */
+  function checkForUpdate() {
+    if (!window.fetch || location.protocol.indexOf('http') !== 0) return;
+    var url = location.pathname + '?check=' + Date.now();
+    fetch(url, { cache: 'no-store' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (txt) {
+      var m = /var BUILD_ID = '([^']+)'/.exec(txt || '');
+      if (!m || m[1] === BUILD_ID) return;
+      var tried = null; try { tried = sessionStorage.getItem('roster.updateTo'); } catch (e) {}
+      if (tried === m[1]) return;
+      try { sessionStorage.setItem('roster.updateTo', m[1]); } catch (e) {}
+      if (S.game && S.game.mode === 'shared' && screenFor() === 'draft') return;
+      location.replace(location.pathname + '?v=' + encodeURIComponent(m[1]) + location.hash);
+    }).catch(function () {});
+  }
   function applyWebCopy() {
     var intro = document.getElementById('score-intro'), qn = document.getElementById('quick-note');
     if (intro) intro.textContent = 'Each pick is scored from 1.0 to 10.0 against its subtopic’s ranked list. The higher an answer ranks, the higher it scores.';
@@ -3268,7 +3283,8 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       S.env.uid = webUid();
       S.env.db = makeWebDb(S.env.uid);
       S.env.orgHash = /^#organizer$/i.test(location.hash || '');
-      var nd = document.getElementById('net-diag'); if (nd) { nd.hidden = false; nd.textContent = 'Relay check · not connected yet (connects when you create or join a room)'; }
+      var nd = document.getElementById('net-diag'); if (nd) { nd.hidden = false; nd.textContent = 'Relay check · version ' + BUILD_ID + ' · not connected yet (connects when you create or join a room)'; }
+      checkForUpdate();
       applyWebCopy();
     }
     S.env.ready = true;
