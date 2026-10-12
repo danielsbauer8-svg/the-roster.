@@ -2421,7 +2421,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     var db = S.env.db;
     try {
       var snap = await db.doc('rooms/' + code).get();
-      if (!snap.exists) { setMsg('No room with code ' + code + '. Check the code with your host.', true); return; }
+      if (!snap.exists) { setMsg('No room with code ' + code + '. Check the code with your host' + (S.env.web ? '. If it’s right, make sure their page is open on the room screen, then try again.' : '.'), true); return; }
       var room = snap.data();
       var mine = await db.doc('rooms/' + code + '/players/' + S.env.uid).get();
       if (room.status !== 'lobby' && !mine.exists) { setMsg('That draft has already started. You can watch it.'); enterRoom(code); return; }
@@ -2936,7 +2936,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
   function makeNetStore(uid) {
     /* Rooms live on a public MQTT relay as retained messages: one topic per document,
        so anyone in the room can read and write, nobody has to host, and it works on any network. */
-    var conn = null, rooms = {}, subs = {}, pendingSub = {};
+    var conns = [], connP = null, rooms = {}, subs = {}, myTag = 'c' + Math.random().toString(36).slice(2, 10);
     function loadLib() {
       if (window.mqtt && window.mqtt.connect) return Promise.resolve(window.mqtt);
       if (!S.env.mqttLibP) S.env.mqttLibP = new Promise(function (res, rej) {
@@ -2955,28 +2955,33 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     }
     function netFail() { if (!S.env.netError) { S.env.netError = true; render(); } }
     function netOk() { if (S.env.netError) { S.env.netError = false; render(); } }
+    function live() { return conns.filter(function (c) { return c.connected; }); }
+    /* Connect to every relay at once; ready as soon as one answers. Writes go to all of them and
+       reads come from all of them, so two phones meet as long as they share any one relay. */
     function client() {
-      if (conn) return conn;
-      conn = loadLib().then(function (mqtt) {
+      if (connP) return connP;
+      connP = loadLib().then(function (mqtt) {
         return new Promise(function (resolve, reject) {
-          var b = 0;
-          (function tryBroker() {
-            if (b >= MQTT_BROKERS.length) { conn = null; netFail(); reject(new Error('no-broker')); return; }
-            var url = MQTT_BROKERS[b++], settled = false;
-            var c = mqtt.connect(url, { clientId: ('rs' + uid.replace(/[^a-z0-9]/gi, '').slice(-8) + Math.random().toString(36).slice(2, 10)).slice(0, 22), clean: true, keepalive: 30, connectTimeout: 7000, reconnectPeriod: 2500 });
-            var giveUp = setTimeout(function () { if (!settled) { settled = true; try { c.end(true); } catch (e) {} tryBroker(); } }, 8000);
+          var failed = 0, done = false;
+          MQTT_BROKERS.forEach(function (url) {
+            var c = mqtt.connect(url, { clientId: ('rs' + uid.replace(/[^a-z0-9]/gi, '').slice(-8) + Math.random().toString(36).slice(2, 10)).slice(0, 22), clean: true, keepalive: 30, connectTimeout: 8000, reconnectPeriod: 3000 });
+            var gaveUp = false;
+            var timer = setTimeout(function () { if (!c.connected && !gaveUp) { gaveUp = true; failed++; if (failed === MQTT_BROKERS.length && !done) { done = true; connP = null; netFail(); reject(new Error('no-broker')); } } }, 9000);
             c.on('connect', function () {
+              clearTimeout(timer);
+              if (conns.indexOf(c) < 0) conns.push(c);
               netOk();
-              if (!settled) { settled = true; clearTimeout(giveUp); resolve(c); }
-              else Object.keys(subs).forEach(function (t) { c.subscribe(t, { qos: 1 }); });
+              Object.keys(subs).forEach(function (t) { c.subscribe(t, { qos: 1 }); });
+              Object.keys(rooms).forEach(function (code) { requestSync(rooms[code], c); });
+              if (!done) { done = true; resolve(true); }
             });
             c.on('message', function (topic, payload) { onMessage(String(topic), payload); });
-            c.on('offline', function () { if (settled) netFail(); });
-            c.on('error', function () { if (!settled) { settled = true; clearTimeout(giveUp); try { c.end(true); } catch (e) {} tryBroker(); } });
-          })();
+            c.on('offline', function () { if (!live().length) netFail(); });
+            c.on('error', function () {});
+          });
         });
-      }, function (e) { conn = null; netFail(); throw e; });
-      return conn;
+      }, function (e) { connP = null; netFail(); throw e; });
+      return connP;
     }
     function topicFor(path) { return MQTT_ROOT + path; }
     function parse(path) {
@@ -2984,7 +2989,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       return m ? { code: m[1], rel: m[2] || '' } : null;
     }
     function room(code) {
-      if (!rooms[code]) rooms[code] = { code: code, store: {}, listeners: [], ready: null, closeTimer: null, notifyQueued: false, lastMsg: 0 };
+      if (!rooms[code]) rooms[code] = { code: code, store: {}, listeners: [], ready: null, closeTimer: null, notifyQueued: false, lastMsg: 0, answered: {} };
       return rooms[code];
     }
     function decode(payload) {
@@ -2995,13 +3000,48 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     function onMessage(topic, payload) {
       if (topic.indexOf(MQTT_ROOT) !== 0) return;
       var path = topic.slice(MQTT_ROOT.length);
-      var idx = /^pub\/[^/]+\/([A-Z]{5})$/.exec(path);
-      if (idx) { var v0 = decode(payload); if (S.env.pubIndex) { if (v0 === undefined) delete S.env.pubIndex[idx[1]]; else S.env.pubIndex[idx[1]] = v0; } return; }
+      var ix = /^pub\/([^/]+)\/([^/]+)$/.exec(path);
+      if (ix) {
+        if (ix[2] === '_req') { answerIndex(ix[1]); return; }
+        if (!/^[A-Z]{5}$/.test(ix[2])) return;
+        var v0 = decode(payload);
+        if (S.env.pubIndex) { if (v0 === undefined) delete S.env.pubIndex[ix[2]]; else S.env.pubIndex[ix[2]] = v0; }
+        return;
+      }
       var p = parse(path); if (!p || !rooms[p.code]) return;
       var R = rooms[p.code], v = decode(payload);
+      if (p.rel === '_sync/req') { if (v && v.from !== myTag) answerSync(R, v.id); return; }
+      if (p.rel === '_sync/state') {
+        if (!v || !v.store) return;
+        R.answered[v.id] = true;
+        var added = false;
+        Object.keys(v.store).forEach(function (k) { if (!(k in R.store) && k.indexOf('_sync') !== 0) { R.store[k] = v.store[k]; added = true; } });
+        if (added) { R.lastMsg = Date.now(); queueNotify(R); }
+        return;
+      }
       R.lastMsg = Date.now();
       if (v === undefined) delete R.store[p.rel]; else R.store[p.rel] = v;
       queueNotify(R);
+    }
+    function sendRaw(path, body, retain, only) {
+      var targets = only ? [only] : live();
+      targets.forEach(function (c) { try { c.publish(topicFor(path), body, { qos: 1, retain: !!retain }); } catch (e) {} });
+    }
+    function requestSync(R, only) {
+      var id = Math.random().toString(36).slice(2, 10);
+      sendRaw('rooms/' + R.code + '/_sync/req', JSON.stringify({ from: myTag, id: id }), false, only);
+    }
+    function answerSync(R, id) {
+      if (!('' in R.store) || !id) return;
+      setTimeout(function () {
+        if (R.answered[id]) return;
+        R.answered[id] = true;
+        var st = {}; Object.keys(R.store).forEach(function (k) { st[k] = R.store[k]; });
+        sendRaw('rooms/' + R.code + '/_sync/state', JSON.stringify({ id: id, from: myTag, store: st }), false);
+      }, 50 + Math.floor(Math.random() * 350));
+    }
+    function answerIndex(day) {
+      Object.keys(rooms).forEach(function (code) { var r = rooms[code].store['']; if (r && r.isPublic && r.status === 'lobby' && r.dateKey === day) indexRoom(code, r); });
     }
     function docSnap(R, rel) { return { exists: rel in R.store, id: rel.split('/').pop() || R.code, data: function () { return jclone(R.store[rel]); } }; }
     function colSnap(R, rel) {
@@ -3019,24 +3059,30 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       }, 0);
     }
     function subscribe(topic) {
-      return client().then(function (c) {
+      return client().then(function () {
         if (subs[topic]) return subs[topic];
         subs[topic] = new Promise(function (resolve, reject) {
-          c.subscribe(topic, { qos: 1 }, function (err) { if (err) { delete subs[topic]; reject(err); } else resolve(c); });
+          var cs = live(), left = cs.length, ok = false;
+          if (!cs.length) { delete subs[topic]; reject(new Error('offline')); return; }
+          cs.forEach(function (c) {
+            c.subscribe(topic, { qos: 1 }, function (err) { left--; if (!err && !ok) { ok = true; resolve(true); } else if (!left && !ok) { delete subs[topic]; reject(err || new Error('sub')); } });
+          });
         });
         return subs[topic];
       });
     }
-    /* Subscribe to a room and wait until its stored documents have arrived. */
+    /* Subscribe to a room, then gather its documents: stored copies from the relay, plus a copy
+       from anyone already in the room (asked for with a sync request). */
     function ensure(code) {
       var R = room(code);
       if (R.ready) return R.ready;
       R.ready = subscribe(topicFor('rooms/' + code + '/#')).then(function () {
+        requestSync(R);
         return new Promise(function (resolve) {
           var start = Date.now();
           (function wait() {
-            var idle = Date.now() - (R.lastMsg || start);
-            if ((R.lastMsg && idle > 350 && Date.now() - start > 600) || Date.now() - start > 2200) resolve(R);
+            var t = Date.now() - start, idle = Date.now() - (R.lastMsg || start);
+            if (('' in R.store && idle > 400 && t > 700) || t > 3500) resolve(R);
             else setTimeout(wait, 100);
           })();
         });
@@ -3044,10 +3090,15 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       return R.ready;
     }
     function publish(path, data) {
-      return client().then(function (c) {
+      return client().then(function () {
+        var cs = live();
+        if (!cs.length) throw new Error('offline');
+        var body = data === undefined ? '' : JSON.stringify(data);
         return new Promise(function (resolve, reject) {
-          var body = data === undefined ? '' : JSON.stringify(data);
-          c.publish(topicFor(path), body, { qos: 1, retain: true }, function (err) { err ? reject(err) : resolve(); });
+          var left = cs.length, ok = false;
+          cs.forEach(function (c) {
+            c.publish(topicFor(path), body, { qos: 1, retain: true }, function (err) { left--; if (!err && !ok) { ok = true; resolve(); } else if (!left && !ok) reject(err || new Error('pub')); });
+          });
         });
       });
     }
@@ -3072,7 +3123,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       R.closeTimer = setTimeout(function () {
         if (R.listeners.length) return;
         var t = topicFor('rooms/' + R.code + '/#');
-        if (subs[t]) { delete subs[t]; client().then(function (c) { try { c.unsubscribe(t); } catch (e) {} }).catch(function () {}); }
+        if (subs[t]) { delete subs[t]; live().forEach(function (c) { try { c.unsubscribe(t); } catch (e) {} }); }
         delete rooms[R.code];
       }, 3000);
     }
@@ -3108,7 +3159,8 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     function publicRooms(day) {
       S.env.pubIndex = S.env.pubIndex || {};
       return subscribe(topicFor('pub/' + day + '/+')).then(function () {
-        return new Promise(function (resolve) { setTimeout(function () { resolve(jclone(S.env.pubIndex) || {}); }, 1500); });
+        sendRaw('pub/' + day + '/_req', JSON.stringify({ from: myTag }), false);
+        return new Promise(function (resolve) { setTimeout(function () { resolve(jclone(S.env.pubIndex) || {}); }, 2000); });
       });
     }
     return { doc: doc, collection: collection, publicRooms: publicRooms };
