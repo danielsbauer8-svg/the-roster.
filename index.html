@@ -487,6 +487,7 @@ button.bsub[aria-pressed="true"] { box-shadow: 0 0 0 3px #fff, 0 3px 0 rgba(29, 
         <button class="btn primary" type="button" data-act="goto-mode" data-mode="room">Join a room</button>
         <button class="btn" type="button" data-act="goto-mode" data-mode="random">Play random people</button>
         <button class="btn" type="button" data-act="goto-mode" data-mode="offline">Offline vs AI</button>
+        <button class="btn" type="button" data-act="goto-mode" data-mode="practice">Practice: random topic</button>
       </div>
     </div>
   </section>
@@ -566,6 +567,24 @@ button.bsub[aria-pressed="true"] { box-shadow: 0 0 0 3px #fff, 0 3px 0 rgba(29, 
                   </select>
                 </div>
                 <button class="btn primary block" type="button" data-act="play-offline">Play offline</button>
+              </div>
+
+              <div class="mode" id="mode-practice">
+                <h3>Practice</h3>
+                <p>A random topic from all 100, as many times as you like. Just you against the AI, and today's game stays the same.</p>
+                <div>
+                  <label class="mono label" for="practice-bots">AI opponents</label>
+                  <select class="field" id="practice-bots">
+                    <option value="1">1 opponent</option>
+                    <option value="2">2 opponents</option>
+                    <option value="3" selected>3 opponents</option>
+                    <option value="4">4 opponents</option>
+                    <option value="5">5 opponents</option>
+                    <option value="6">6 opponents</option>
+                    <option value="7">7 opponents</option>
+                  </select>
+                </div>
+                <button class="btn primary block" type="button" data-act="play-practice">Start practice</button>
               </div>
             </div>
           </div>
@@ -2031,7 +2050,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     $('hero').hidden = inPlay || inOrg; $('how').hidden = inPlay || inOrg; $('play').hidden = !inPlay; $('organizer').hidden = !inOrg;
     $('org-btn').hidden = !orgAllowed() || inOrg;
     persistSession();
-    ['room', 'random', 'offline'].forEach(function (m) { $('mode-' + m).hidden = m !== S.mode; });
+    ['room', 'random', 'offline', 'practice'].forEach(function (m) { $('mode-' + m).hidden = m !== S.mode; });
     $('back-btn').hidden = !!S.game;
     renderBanner();
     ['modes', 'lobby', 'draft', 'results'].forEach(function (s) { $('scr-' + s).hidden = s !== scr; });
@@ -2049,7 +2068,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       : 'Rooms and matchmaking need you signed in to claude.ai with “Can edit” access to this page.';
     on.className = 'note bad';
     document.querySelectorAll('[data-act="create-room"],[data-act="join-room"],[data-act="find-match"]').forEach(function (b) { b.disabled = !online; });
-    $('console-label').textContent = scr === 'modes' ? ({ room: 'Join a room', random: 'Play random people', offline: 'Offline vs AI' })[S.mode] : scr === 'lobby' ? 'Room lobby' : scr === 'draft' ? 'Draft in progress' : 'Final results';
+    $('console-label').textContent = scr === 'modes' ? ({ room: 'Join a room', random: 'Play random people', offline: 'Offline vs AI', practice: 'Practice' })[S.mode] : scr === 'lobby' ? 'Room lobby' : scr === 'draft' ? 'Draft in progress' : 'Final results';
     if (scr === 'lobby') renderLobby();
     if (scr === 'draft') renderDraft();
     if (scr === 'results') renderResults();
@@ -2061,6 +2080,14 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     var g = S.game, topicId = g ? g.topicId : TODAY.topicId, subs = g ? g.subs : TODAY.subs, t = TOPICS[topicId];
     var mineOn = g && g.players[S.me] && g.status === 'drafting';
     $('tb-name').textContent = t.name;
+    var tbl = document.querySelector('#topic-banner .banner-main .mono'); if (tbl) tbl.textContent = g && g.practice ? 'Practice topic' : 'Topic';
+    if (!g && S.mode === 'practice') {
+      $('tb-name').textContent = 'Surprise topic';
+      $('tb-q').textContent = 'One of 100 topics, picked at random when you start.';
+      $('tb-subs').innerHTML = '<span class="bsub locked">' + LOCK_SVG + '5 random subtopics</span>';
+      if (tbl) tbl.textContent = 'Practice';
+      return;
+    }
     $('tb-q').textContent = t.q;
     if (g && g.status !== 'lobby' && derive(g, now()).complete) {
       var focus = t10Focus(g);
@@ -2208,7 +2235,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     $('save-btn').disabled = !res || saved;
     $('save-btn').textContent = saved ? 'Saved to your account' : 'Save my result';
     $('save-note').textContent = (!res || saved) ? '' : (S.env.db && S.env.uid ? (S.account.profile ? '' : (S.env.web ? 'Pick a username to save results on this device.' : 'Saving needs an account.')) : 'Saving needs an account, which needs you signed in to claude.ai on this page.');
-    $('again-btn').textContent = g.mode === 'local' ? 'Play again' : 'New game';
+    $('again-btn').textContent = g.practice ? 'New random topic' : g.mode === 'local' ? 'Play again' : 'New game';
   }
 
   /* ---------- combobox ---------- */
@@ -2376,20 +2403,26 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
   }
 
   /* ---------- offline ---------- */
-  function playOffline(count) {
+  function practiceSpec() {
+    var ids = Object.keys(TOPICS).filter(function (id) { return id !== TODAY.topicId && id !== S.lastPracticeTopic; });
+    var id = ids[Math.floor(Math.random() * ids.length)];
+    S.lastPracticeTopic = id;
+    return { dateKey: dateKey(new Date()), topicId: id, subs: shuffled(TOPICS[id].subs, Math.random).slice(0, SUBS_PER_DAY) };
+  }
+  function playOffline(count, practice) {
     var name = myName() || 'You';
     count = Math.max(1, Math.min(7, count || 3));
     leaveGame(true);
-    var spec = dailySpec(dateKey(new Date()));
+    var spec = practice ? practiceSpec() : dailySpec(dateKey(new Date()));
     var players = { you: { name: name, joinedAt: 0 } };
     var bots = shuffled(BOT_NAMES, Math.random).slice(0, count);
     bots.forEach(function (b, i) { players['bot' + i] = { name: b + ' (AI)', bot: true, joinedAt: i + 1 }; });
     var t0 = now();
-    S.game = { mode: 'local', code: 'LOCAL', isPublic: false, hostId: 'you', topicId: spec.topicId, subs: spec.subs, dateKey: spec.dateKey, status: 'drafting', order: shuffled(Object.keys(players), Math.random), startedAt: t0, players: players, picks: [], results: null };
+    S.game = { mode: 'local', practice: !!practice, code: 'LOCAL', isPublic: false, hostId: 'you', topicId: spec.topicId, subs: spec.subs, dateKey: spec.dateKey, status: 'drafting', order: shuffled(Object.keys(players), Math.random), startedAt: t0, players: players, picks: [], results: null };
     S.me = 'you';
     S.autoDone = {}; S.botForN = -1; S.scoreWaitSince = 0; S.waitShown = false;
     S.scoring = { state: 'idle', msg: '', forGame: '' };
-    S.lastSettings = { mode: 'local', count: count };
+    S.lastSettings = { mode: 'local', count: count, practice: !!practice };
     setMsg('');
     render();
   }
@@ -2591,7 +2624,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     var rows = standings(g, g.results.scores), mine = rows.filter(function (r) { return r.pid === S.me; })[0];
     if (!mine) return;
     var rec = {
-      at: now(), dateKey: g.dateKey, topic: TOPICS[g.topicId].name, mode: g.mode === 'local' ? 'offline' : (g.isPublic ? 'random' : 'room'),
+      at: now(), dateKey: g.dateKey, topic: TOPICS[g.topicId].name, mode: g.practice ? 'practice' : g.mode === 'local' ? 'offline' : (g.isPublic ? 'random' : 'room'),
       score: mine.total, max: g.subs.length * 10, rank: mine.rank, players: rows.length, won: mine.rank === 1,
       picks: g.picks.filter(function (p) { return p.pid === S.me; }).map(function (p) { var s = g.results.scores['p' + p.n]; return { sub: p.sub, name: p.name, score: s ? s.score : 0 }; })
     };
@@ -2797,6 +2830,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     if (act === 'goto-mode') gotoMode(t.getAttribute('data-mode'));
     else if (act === 'home') { ev.preventDefault(); if (!S.game) showView('home'); else window.scrollTo(0, 0); }
     else if (act === 'play-offline') playOffline(parseInt($('bot-count').value, 10));
+    else if (act === 'play-practice') playOffline(parseInt($('practice-bots').value, 10), true);
     else if (act === 'create-room') createRoom(false);
     else if (act === 'join-room') joinRoom($('room-code').value);
     else if (act === 'find-match') findMatch();
@@ -2826,7 +2860,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     else if (act === 'quick') { var qg = S.game; if (qg) applyResults(qg, gameId(qg), builtinResults(qg), ''); }
     else if (act === 'save') saveResult();
     else if (act === 'again') {
-      if (S.lastSettings && S.lastSettings.mode === 'local') playOffline(S.lastSettings.count);
+      if (S.lastSettings && S.lastSettings.mode === 'local') playOffline(S.lastSettings.count, S.lastSettings.practice);
       else leaveGame(false);
     }
     else if (act === 'account') openAccount();
@@ -2884,7 +2918,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
      On a normal website (no claude.ai capabilities) rooms run peer to peer through PeerJS.
      The room creator's browser hosts the room's data; everyone else connects to it directly.
      It mimics the small slice of the db interface the room code uses, so the game logic is shared. */
-  var BUILD_ID = '2026-10-12-5';
+  var BUILD_ID = '2026-10-12-6';
   var MQTT_ROOT = 'theroster/v2/';
   var MQTT_BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
   var MQTT_SRCS = ['https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js', 'https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js'];
