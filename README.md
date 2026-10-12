@@ -2,8 +2,8 @@
 
 A daily draft game. One topic, five subtopics: draft the best roster against friends or AI.
 
-Play: https://danielsbauer8-svg.github.io/the-roster/
+Play: https://danielsbauer8-svg.github.io/the-roster./
 
-The whole game is the single `index.html` file. Rooms connect players directly (peer to peer), so the room creator keeps their page open until the draft ends.
+The whole game is the single `index.html` file. Rooms sync through a public MQTT relay, so no accounts are needed and nobody has to host.
 
 To change upcoming topics, open the site with `#organizer` at the end of the address, save, and replace `index.html` with the downloaded file.

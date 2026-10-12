@@ -2082,7 +2082,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     var g = S.game, ps = sortedPlayers(g), t = TOPICS[g.topicId];
     $('lobby-kind').textContent = g.isPublic ? 'Public room · random players' : 'Private room';
     $('lobby-code').textContent = g.code;
-    $('lobby-hint').textContent = (g.isPublic ? 'Waiting for other players to be matched here.' : 'Share the code or the link.') + (S.env.web && g.hostId === S.me ? ' Your device is hosting this room, so keep this page open until the draft ends.' : '');
+    $('lobby-hint').textContent = (g.isPublic ? 'Waiting for other players to be matched here.' : 'Share the code or the link.') + '';
     $('share-link').value = (S.env.web ? location.origin + location.pathname : ARTIFACT_URL) + '#r-' + g.code;
     $('lobby-count').textContent = 'Players · ' + ps.length + ' of ' + MAX_PLAYERS;
     $('lobby-players').innerHTML = ps.map(function (p, i) {
@@ -2421,7 +2421,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     var db = S.env.db;
     try {
       var snap = await db.doc('rooms/' + code).get();
-      if (!snap.exists) { setMsg('No room with code ' + code + '. Check the code with your host' + (S.env.web ? ', and make sure their page is still open.' : '.'), true); return; }
+      if (!snap.exists) { setMsg('No room with code ' + code + '. Check the code with your host.', true); return; }
       var room = snap.data();
       var mine = await db.doc('rooms/' + code + '/players/' + S.env.uid).get();
       if (room.status !== 'lobby' && !mine.exists) { setMsg('That draft has already started. You can watch it.'); enterRoom(code); return; }
@@ -2460,7 +2460,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     S.lastSettings = { mode: 'shared' };
     S.game = { mode: 'shared', code: code, isPublic: false, hostId: null, topicId: TODAY.topicId, subs: TODAY.subs, dateKey: TODAY.dateKey, status: 'lobby', order: [], startedAt: 0, players: {}, picks: [], results: null };
     var g = S.game;
-    var onErr = function () { if (S.game === g && screenFor() === 'results') return; setMsg(S.env.web ? 'Lost the connection to the room’s host. If their page closed, the room has ended.' : 'Lost the connection to the room. Reload the page to rejoin.', true); };
+    var onErr = function () { if (S.game === g && screenFor() === 'results') return; setMsg(S.env.web ? 'Lost the connection to the room. Check your internet, then reload the page to rejoin.' : 'Lost the connection to the room. Reload the page to rejoin.', true); };
     S.unsub.push(db.doc('rooms/' + code).onSnapshot(function (s) {
       if (S.game !== g) return;
       if (!s.exists) { setMsg('This room no longer exists.', true); return; }
@@ -2882,8 +2882,9 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
      On a normal website (no claude.ai capabilities) rooms run peer to peer through PeerJS.
      The room creator's browser hosts the room's data; everyone else connects to it directly.
      It mimics the small slice of the db interface the room code uses, so the game logic is shared. */
-  var PEER_PREFIX = 'theroster-v1-';
-  var PEERJS_SRCS = ['https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js'];
+  var MQTT_ROOT = 'theroster/v2/';
+  var MQTT_BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+  var MQTT_SRCS = ['https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js', 'https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js'];
   function jclone(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
   function webUid() {
     if (TEST.uid) return TEST.uid;
@@ -2933,32 +2934,74 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
   }
 
   function makeNetStore(uid) {
-    var rooms = {}, clientPeerP = null, waiting = {}, seq = 0;
-    function loadPeerLib() {
-      if (window.Peer) return Promise.resolve(window.Peer);
-      if (!S.env.peerLibP) S.env.peerLibP = new Promise(function (res, rej) {
+    /* Rooms live on a public MQTT relay as retained messages: one topic per document,
+       so anyone in the room can read and write, nobody has to host, and it works on any network. */
+    var conn = null, rooms = {}, subs = {}, pendingSub = {};
+    function loadLib() {
+      if (window.mqtt && window.mqtt.connect) return Promise.resolve(window.mqtt);
+      if (!S.env.mqttLibP) S.env.mqttLibP = new Promise(function (res, rej) {
         var i = 0;
         (function next() {
-          if (window.Peer) { res(window.Peer); return; }
-          if (i >= PEERJS_SRCS.length) { S.env.peerLibP = null; rej(new Error('peer-lib')); return; }
+          if (window.mqtt && window.mqtt.connect) { res(window.mqtt); return; }
+          if (i >= MQTT_SRCS.length) { S.env.mqttLibP = null; rej(new Error('mqtt-lib')); return; }
           var s = document.createElement('script');
-          s.src = PEERJS_SRCS[i++]; s.async = true;
-          s.onload = function () { window.Peer ? res(window.Peer) : next(); };
+          s.src = MQTT_SRCS[i++]; s.async = true;
+          s.onload = function () { (window.mqtt && window.mqtt.connect) ? res(window.mqtt) : next(); };
           s.onerror = next;
           document.head.appendChild(s);
         })();
       });
-      return S.env.peerLibP;
+      return S.env.mqttLibP;
     }
     function netFail() { if (!S.env.netError) { S.env.netError = true; render(); } }
     function netOk() { if (S.env.netError) { S.env.netError = false; render(); } }
+    function client() {
+      if (conn) return conn;
+      conn = loadLib().then(function (mqtt) {
+        return new Promise(function (resolve, reject) {
+          var b = 0;
+          (function tryBroker() {
+            if (b >= MQTT_BROKERS.length) { conn = null; netFail(); reject(new Error('no-broker')); return; }
+            var url = MQTT_BROKERS[b++], settled = false;
+            var c = mqtt.connect(url, { clientId: ('rs' + uid.replace(/[^a-z0-9]/gi, '').slice(-8) + Math.random().toString(36).slice(2, 10)).slice(0, 22), clean: true, keepalive: 30, connectTimeout: 7000, reconnectPeriod: 2500 });
+            var giveUp = setTimeout(function () { if (!settled) { settled = true; try { c.end(true); } catch (e) {} tryBroker(); } }, 8000);
+            c.on('connect', function () {
+              netOk();
+              if (!settled) { settled = true; clearTimeout(giveUp); resolve(c); }
+              else Object.keys(subs).forEach(function (t) { c.subscribe(t, { qos: 1 }); });
+            });
+            c.on('message', function (topic, payload) { onMessage(String(topic), payload); });
+            c.on('offline', function () { if (settled) netFail(); });
+            c.on('error', function () { if (!settled) { settled = true; clearTimeout(giveUp); try { c.end(true); } catch (e) {} tryBroker(); } });
+          })();
+        });
+      }, function (e) { conn = null; netFail(); throw e; });
+      return conn;
+    }
+    function topicFor(path) { return MQTT_ROOT + path; }
     function parse(path) {
       var m = /^rooms\/([A-Z]{5})(?:\/(.+))?$/.exec(path);
       return m ? { code: m[1], rel: m[2] || '' } : null;
     }
     function room(code) {
-      if (!rooms[code]) rooms[code] = { code: code, role: null, store: {}, listeners: [], conns: [], conn: null, peer: null, pending: {}, joining: null, closeTimer: null, lost: false };
+      if (!rooms[code]) rooms[code] = { code: code, store: {}, listeners: [], ready: null, closeTimer: null, notifyQueued: false, lastMsg: 0 };
       return rooms[code];
+    }
+    function decode(payload) {
+      var txt = typeof payload === 'string' ? payload : (payload && payload.toString ? payload.toString() : '');
+      if (!txt) return undefined;
+      try { return JSON.parse(txt); } catch (e) { return undefined; }
+    }
+    function onMessage(topic, payload) {
+      if (topic.indexOf(MQTT_ROOT) !== 0) return;
+      var path = topic.slice(MQTT_ROOT.length);
+      var idx = /^pub\/[^/]+\/([A-Z]{5})$/.exec(path);
+      if (idx) { var v0 = decode(payload); if (S.env.pubIndex) { if (v0 === undefined) delete S.env.pubIndex[idx[1]]; else S.env.pubIndex[idx[1]] = v0; } return; }
+      var p = parse(path); if (!p || !rooms[p.code]) return;
+      var R = rooms[p.code], v = decode(payload);
+      R.lastMsg = Date.now();
+      if (v === undefined) delete R.store[p.rel]; else R.store[p.rel] = v;
+      queueNotify(R);
     }
     function docSnap(R, rel) { return { exists: rel in R.store, id: rel.split('/').pop() || R.code, data: function () { return jclone(R.store[rel]); } }; }
     function colSnap(R, rel) {
@@ -2967,202 +3010,88 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
         .map(function (k) { return { id: k.slice(pre.length), data: function () { return jclone(R.store[k]); } }; });
       return { docs: docs, size: docs.length, empty: !docs.length };
     }
-    function notify(R) {
-      R.listeners.slice().forEach(function (l) {
-        try { l.cb(l.kind === 'doc' ? docSnap(R, l.rel) : colSnap(R, l.rel)); } catch (e) { setTimeout(function () { throw e; }, 0); }
+    function queueNotify(R) {
+      if (R.notifyQueued) return;
+      R.notifyQueued = true;
+      setTimeout(function () {
+        R.notifyQueued = false;
+        R.listeners.slice().forEach(function (l) { try { l.cb(l.kind === 'doc' ? docSnap(R, l.rel) : colSnap(R, l.rel)); } catch (e) { setTimeout(function () { throw e; }, 0); } });
+      }, 0);
+    }
+    function subscribe(topic) {
+      return client().then(function (c) {
+        if (subs[topic]) return subs[topic];
+        subs[topic] = new Promise(function (resolve, reject) {
+          c.subscribe(topic, { qos: 1 }, function (err) { if (err) { delete subs[topic]; reject(err); } else resolve(c); });
+        });
+        return subs[topic];
       });
     }
-    function applyOp(R, op) {
-      if (!op || typeof op.rel !== 'string') return;
-      if (op.k === 'set') R.store[op.rel] = jclone(op.data);
-      else if (op.k === 'update') R.store[op.rel] = Object.assign({}, R.store[op.rel] || {}, jclone(op.data));
-      else if (op.k === 'delete') delete R.store[op.rel];
-    }
-    function persistHost(R) { try { sessionStorage.setItem('roster.host.' + R.code, JSON.stringify(R.store)); } catch (e) {} }
-    function hostApply(R, op) {
-      applyOp(R, op); persistHost(R);
-      R.conns.forEach(function (c) { try { c.send({ t: 'op', op: op }); } catch (e) {} });
-      notify(R);
-    }
-    function onHostMsg(R, conn, m) {
-      if (!m || typeof m !== 'object') return;
-      if (m.t === 'write' && m.op && typeof m.op.rel === 'string' && m.op.rel.length < 80 && /^(players|picks|meta)\/[\w.-]+$|^$/.test(m.op.rel)) {
-        hostApply(R, m.op);
-        try { conn.send({ t: 'ack', id: m.id }); } catch (e) {}
-      } else if (m.t === 'write') { try { conn.send({ t: 'ack', id: m.id, err: 'bad' }); } catch (e) {} }
-    }
-    /* ----- host ----- */
-    function startHost(R, initial, attempts) {
-      return loadPeerLib().then(function (Peer) {
+    /* Subscribe to a room and wait until its stored documents have arrived. */
+    function ensure(code) {
+      var R = room(code);
+      if (R.ready) return R.ready;
+      R.ready = subscribe(topicFor('rooms/' + code + '/#')).then(function () {
         return new Promise(function (resolve) {
-          var tries = 0;
-          (function attempt() {
-            tries++;
-            var P = new Peer(PEER_PREFIX + R.code, { debug: 0 });
-            var opened = false;
-            P.on('open', function () {
-              opened = true; netOk();
-              R.peer = P; R.role = 'host'; R.lost = false;
-              if (initial) R.store = initial;
-              persistHost(R);
-              resolve(R); notify(R);
-            });
-            P.on('connection', function (conn) {
-              conn.on('open', function () { R.conns.push(conn); try { conn.send({ t: 'sync', store: R.store }); } catch (e) {} });
-              conn.on('data', function (m) { onHostMsg(R, conn, m); });
-              var drop = function () { R.conns = R.conns.filter(function (c) { return c !== conn; }); };
-              conn.on('close', drop); conn.on('error', drop);
-            });
-            P.on('disconnected', function () { if (R.peer === P) { try { P.reconnect(); } catch (e) {} } });
-            P.on('error', function (err) {
-              var t = err && err.type;
-              if (opened) { if (t === 'network' || t === 'server-error' || t === 'socket-error') netFail(); return; }
-              try { P.destroy(); } catch (e) {}
-              if (t === 'unavailable-id' && tries < attempts) { setTimeout(attempt, 3000); return; }
-              if ((t === 'network' || t === 'server-error' || t === 'socket-error' || t === 'socket-closed') ) netFail();
-              resolve(null);
-            });
+          var start = Date.now();
+          (function wait() {
+            var idle = Date.now() - (R.lastMsg || start);
+            if ((R.lastMsg && idle > 350 && Date.now() - start > 600) || Date.now() - start > 2200) resolve(R);
+            else setTimeout(wait, 100);
           })();
         });
-      }, function () { netFail(); return null; });
+      }, function (e) { R.ready = null; throw e; });
+      return R.ready;
     }
-    /* ----- client ----- */
-    function clientPeer() {
-      if (!clientPeerP) clientPeerP = loadPeerLib().then(function (Peer) {
+    function publish(path, data) {
+      return client().then(function (c) {
         return new Promise(function (resolve, reject) {
-          var P = new Peer({ debug: 0 });
-          var opened = false;
-          P.on('open', function () { opened = true; netOk(); resolve(P); });
-          P.on('disconnected', function () { try { P.reconnect(); } catch (e) {} });
-          P.on('error', function (err) {
-            var t = err && err.type, msg = String((err && err.message) || '');
-            if (t === 'peer-unavailable') {
-              Object.keys(waiting).forEach(function (target) { if (msg.indexOf(target) >= 0) { var w = waiting[target]; delete waiting[target]; w(); } });
-              return;
-            }
-            if (!opened) { clientPeerP = null; netFail(); reject(err); }
-            else if (t === 'network' || t === 'server-error' || t === 'socket-error') netFail();
-          });
+          var body = data === undefined ? '' : JSON.stringify(data);
+          c.publish(topicFor(path), body, { qos: 1, retain: true }, function (err) { err ? reject(err) : resolve(); });
         });
       });
-      return clientPeerP;
     }
-    function tryConnect(R) {
-      return clientPeer().then(function (P) {
-        return new Promise(function (resolve) {
-          var target = PEER_PREFIX + R.code, done = false;
-          var conn = P.connect(target, { reliable: true, serialization: 'json' });
-          var finish = function (ok) { if (done) return; done = true; clearTimeout(to); if (waiting[target] === fail) delete waiting[target]; if (!ok) { try { conn.close(); } catch (e) {} } resolve(ok ? conn : null); };
-          var fail = function () { finish(false); };
-          waiting[target] = fail;
-          var to = setTimeout(fail, 9000);
-          conn.on('data', function (m) {
-            if (!m || typeof m !== 'object') return;
-            if (m.t === 'sync') {
-              R.store = m.store || {};
-              if (!done) { finish(true); R.conn = conn; R.role = 'client'; R.lost = false; }
-              notify(R);
-            } else if (R.conn !== conn) return;
-            else if (m.t === 'op') { applyOp(R, m.op); notify(R); }
-            else if (m.t === 'ack') { var p = R.pending[m.id]; if (p) { delete R.pending[m.id]; m.err ? p.rej(new Error(m.err)) : p.res(); } }
-          });
-          conn.on('close', function () { if (R.conn === conn) clientLost(R); else fail(); });
-          conn.on('error', function () { if (R.conn === conn) clientLost(R); else fail(); });
-        });
-      }, function () { return null; });
+    function indexRoom(code, r) {
+      if (!r || !r.isPublic || !r.dateKey) return;
+      publish('pub/' + r.dateKey + '/' + code, { code: code, status: r.status, createdAt: r.createdAt || 0 }).catch(function () {});
     }
-    function clientLost(R) {
-      if (R.lost || R.role !== 'client') return;
-      R.lost = true; R.conn = null;
-      Object.keys(R.pending).forEach(function (id) { R.pending[id].rej(new Error('lost')); delete R.pending[id]; });
-      if (!R.listeners.length) { R.role = null; return; }
-      var tries = 0;
-      (function again() {
-        if (!R.listeners.length) { R.role = null; return; }
-        tries++;
-        tryConnect(R).then(function (conn) {
-          if (conn) return;
-          if (tries < 40) setTimeout(again, 2500);
-          else { R.role = null; R.listeners.forEach(function (l) { if (l.err) l.err(new Error('lost')); }); }
-        });
-      })();
-    }
-    /* ----- joining ----- */
-    function ensure(code, attempts) {
-      var R = room(code);
-      if (R.role === 'host' || (R.role === 'client' && R.conn)) return Promise.resolve(R);
-      if (R.joining) return R.joining;
-      var backup = null;
-      try { backup = JSON.parse(sessionStorage.getItem('roster.host.' + code) || 'null'); } catch (e) {}
-      if (backup) {
-        R.joining = startHost(R, backup, 12).then(function (r) { R.joining = null; return r; });
-        return R.joining;
-      }
-      var n = 0;
-      R.joining = new Promise(function (resolve) {
-        (function attempt() {
-          n++;
-          tryConnect(R).then(function (conn) {
-            if (conn) { R.joining = null; resolve(R); return; }
-            if (n < (attempts || 1)) setTimeout(attempt, 1500);
-            else { R.joining = null; resolve(null); }
-          });
-        })();
-      });
-      return R.joining;
-    }
-    function write(code, op) {
-      return ensure(code, 2).then(function (R) {
-        if (!R) throw new Error('no-room');
-        if (R.role === 'host') { hostApply(R, op); return; }
-        return new Promise(function (res, rej) {
-          var id = ++seq;
-          R.pending[id] = { res: res, rej: rej };
-          try { R.conn.send({ t: 'write', id: id, op: op }); } catch (e) { delete R.pending[id]; rej(e); return; }
-          setTimeout(function () { if (R.pending[id]) { delete R.pending[id]; rej(new Error('timeout')); } }, 8000);
-        });
+    function write(path, kind, data) {
+      var p = parse(path); if (!p) return Promise.reject(new Error('bad path'));
+      return ensure(p.code).then(function (R) {
+        var next;
+        if (kind === 'set') next = jclone(data);
+        else if (kind === 'update') next = Object.assign({}, R.store[p.rel] || {}, jclone(data));
+        if (kind === 'delete') delete R.store[p.rel]; else R.store[p.rel] = next;
+        queueNotify(R);
+        if (p.rel === '' && next) indexRoom(p.code, next);
+        return publish(path, kind === 'delete' ? undefined : next);
       });
     }
     function scheduleClose(R) {
       clearTimeout(R.closeTimer);
       R.closeTimer = setTimeout(function () {
         if (R.listeners.length) return;
-        if (R.role === 'host') {
-          try { sessionStorage.removeItem('roster.host.' + R.code); } catch (e) {}
-          var P = R.peer; R.peer = null; R.role = null; R.conns = [];
-          try { P && P.destroy(); } catch (e) {}
-        } else if (R.conn) { var c = R.conn; R.conn = null; R.role = null; try { c.close(); } catch (e) {} }
+        var t = topicFor('rooms/' + R.code + '/#');
+        if (subs[t]) { delete subs[t]; client().then(function (c) { try { c.unsubscribe(t); } catch (e) {} }).catch(function () {}); }
         delete rooms[R.code];
-      }, 2500);
+      }, 3000);
     }
-    function subscribe(code, kind, rel, cb, err) {
+    function listen(code, kind, rel, cb, err) {
       var R = room(code), l = { kind: kind, rel: rel, cb: cb, err: err };
       R.listeners.push(l); clearTimeout(R.closeTimer);
-      ensure(code, 8).then(function (r) {
-        if (R.listeners.indexOf(l) < 0) return;
-        if (!r) { cb(kind === 'doc' ? docSnap(R, rel) : colSnap(R, rel)); return; }
-        cb(kind === 'doc' ? docSnap(r, rel) : colSnap(r, rel));
-      });
+      ensure(code).then(function (r) { if (R.listeners.indexOf(l) >= 0) cb(kind === 'doc' ? docSnap(r, rel) : colSnap(r, rel)); },
+        function (e) { if (err) err(e); });
       return function () { R.listeners = R.listeners.filter(function (x) { return x !== l; }); if (!R.listeners.length) scheduleClose(R); };
     }
     function doc(path) {
       var p = parse(path);
-      if (!p) return { get: function () { return Promise.resolve({ exists: false, data: function () {} }); }, set: function () { return Promise.reject(new Error('bad path')); }, update: function () { return Promise.reject(new Error('bad path')); }, delete: function () { return Promise.resolve(); }, onSnapshot: function () { return function () {}; } };
       return {
         id: path.split('/').pop(),
-        get: function () {
-          return ensure(p.code, 1).then(function (R) { return R ? docSnap(R, p.rel) : { exists: false, id: p.code, data: function () {} }; });
-        },
-        set: function (d) {
-          var R = room(p.code);
-          if (p.rel === '' && !R.role) {
-            return startHost(R, { '': jclone(d) }, 1).then(function (r) { if (!r) throw new Error('code-taken'); });
-          }
-          return write(p.code, { k: 'set', rel: p.rel, data: jclone(d) });
-        },
-        update: function (d) { return write(p.code, { k: 'update', rel: p.rel, data: jclone(d) }); },
-        delete: function () { return write(p.code, { k: 'delete', rel: p.rel }); },
-        onSnapshot: function (cb, err) { return subscribe(p.code, 'doc', p.rel, cb, err); }
+        get: function () { if (!p) return Promise.resolve({ exists: false, data: function () {} }); return ensure(p.code).then(function (R) { return docSnap(R, p.rel); }); },
+        set: function (d) { return write(path, 'set', d); },
+        update: function (d) { return write(path, 'update', d); },
+        delete: function () { return write(path, 'delete'); },
+        onSnapshot: function (cb, err) { return p ? listen(p.code, 'doc', p.rel, cb, err) : function () {}; }
       };
     }
     function collection(path) {
@@ -3170,15 +3099,19 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       var api = {
         doc: function (id) { return doc(path + '/' + id); },
         where: function () { return api; }, orderBy: function () { return api; }, limit: function () { return api; },
-        get: function () {
-          if (!p) return Promise.resolve({ docs: [], size: 0, empty: true });
-          return ensure(p.code, 1).then(function (R) { return R ? colSnap(R, p.rel) : { docs: [], size: 0, empty: true }; });
-        },
-        onSnapshot: function (cb, err) { return p ? subscribe(p.code, 'col', p.rel, cb, err) : function () {}; }
+        get: function () { if (!p) return Promise.resolve({ docs: [], size: 0, empty: true }); return ensure(p.code).then(function (R) { return colSnap(R, p.rel); }); },
+        onSnapshot: function (cb, err) { return p ? listen(p.code, 'col', p.rel, cb, err) : function () {}; }
       };
       return api;
     }
-    return { doc: doc, collection: collection, isHost: function (code) { return !!(rooms[code] && rooms[code].role === 'host'); } };
+    /* Today's public rooms, for matchmaking. */
+    function publicRooms(day) {
+      S.env.pubIndex = S.env.pubIndex || {};
+      return subscribe(topicFor('pub/' + day + '/+')).then(function () {
+        return new Promise(function (resolve) { setTimeout(function () { resolve(jclone(S.env.pubIndex) || {}); }, 1500); });
+      });
+    }
+    return { doc: doc, collection: collection, publicRooms: publicRooms };
   }
   function makeWebDb(uid) {
     var local = makeLocalStore(), net = makeNetStore(uid);
@@ -3189,31 +3122,24 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       net: net
     };
   }
-  function publicCode(day, n) {
-    var r = rng(hashStr('public:' + day + ':' + n)), s = '';
-    for (var i = 0; i < CODE_LEN; i++) s += CODE_CHARS.charAt(Math.floor(r() * CODE_CHARS.length));
-    return s;
-  }
   async function findMatchWeb() {
     var name = requireName(); if (!name) return;
     var db = S.env.db, today = dateKey(new Date());
     setMsg('Looking for an open public room…');
     try {
-      for (var n = 0; n < 12; n++) {
-        var code = publicCode(today, n);
-        var snap = await db.doc('rooms/' + code).get();
-        if (!snap.exists) {
-          setMsg('No open rooms right now, so you opened one. Others who tap “Play random people” will join you here.');
-          if (await createRoom(true, code)) return;
-          snap = await db.doc('rooms/' + code).get();
-          if (!snap.exists) continue;
-        }
-        var r = snap.data() || {};
-        if (r.status !== 'lobby' || now() - (r.createdAt || 0) > 20 * 60000) continue;
-        var ps = await db.collection('rooms/' + code + '/players').get();
-        if (ps.size < MAX_PLAYERS) { await joinRoom(code); return; }
+      var index = await db.net.publicRooms(today);
+      var open = Object.keys(index).map(function (k) { return index[k]; })
+        .filter(function (r) { return r && r.status === 'lobby' && now() - (r.createdAt || 0) < 20 * 60000; })
+        .sort(function (a, b) { return b.createdAt - a.createdAt; });
+      for (var i = 0; i < open.length; i++) {
+        var snap = await db.doc('rooms/' + open[i].code).get();
+        var r = snap.exists ? snap.data() : null;
+        if (!r || r.status !== 'lobby') continue;
+        var ps = await db.collection('rooms/' + open[i].code + '/players').get();
+        if (ps.size > 0 && ps.size < MAX_PLAYERS) { await joinRoom(open[i].code); return; }
       }
-      setMsg('Every public room is busy right now. Try again in a minute, or create a room for friends.', true);
+      setMsg('No open rooms right now, so you opened one. Others who tap “Play random people” will join you here.');
+      await createRoom(true);
     } catch (e) { setMsg('Matchmaking failed. Check your connection and try again.', true); }
   }
   function downloadFile(name, text) {
