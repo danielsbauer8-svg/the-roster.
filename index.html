@@ -410,6 +410,7 @@ body { background-color: var(--bg); background-image: radial-gradient(var(--dot)
 .t10 h4 { font-size: 1.6rem; color: var(--accent); }
 .t10-focus { border: 3px solid var(--ink); border-radius: 22px; box-shadow: 6px 6px 0 var(--pop); }
 .t10-focus-title { color: var(--accent); }
+.net-diag { font-size: 0.8rem; overflow-wrap: anywhere; padding: 10px 12px; border: 2px dashed var(--line); border-radius: 12px; }
 button.bsub[aria-pressed="true"] { box-shadow: 0 0 0 3px #fff, 0 3px 0 rgba(29, 18, 56, 0.45); }
 
 /* rules */
@@ -538,7 +539,7 @@ button.bsub[aria-pressed="true"] { box-shadow: 0 0 0 3px #fff, 0 3px 0 rgba(29, 
                   <label class="mono label" for="room-code">Have a code? Enter it</label>
                   <div class="row">
                     <input class="field" id="room-code" type="text" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDE" style="text-transform:uppercase;letter-spacing:0.2em">
-                    <button class="btn small" type="button" data-act="join-room">Join room</button>
+                    <button class="btn small primary" type="button" data-act="join-room">Join room</button>
                   </div>
                 </div>
               </div>
@@ -665,6 +666,7 @@ button.bsub[aria-pressed="true"] { box-shadow: 0 0 0 3px #fff, 0 3px 0 rgba(29, 
         </div>
 
         <p class="msg" id="play-msg" role="status" aria-live="polite"></p>
+        <p class="note net-diag" id="net-diag" hidden></p>
       </div>
     </div>
   </section>
@@ -2937,16 +2939,23 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
     /* Rooms live on a public MQTT relay as retained messages: one topic per document,
        so anyone in the room can read and write, nobody has to host, and it works on any network. */
     var conns = [], connP = null, rooms = {}, subs = {}, myTag = 'c' + Math.random().toString(36).slice(2, 10);
+    var diag = S.env.diag = { lib: 'not loaded', relays: {}, msgs: 0, roomMsgs: 0, syncs: 0, bad: 0, sent: 0, errs: [] };
+    function showDiag() {
+      var el = document.getElementById('net-diag'); if (!el) return;
+      var rel = Object.keys(diag.relays).map(function (u) { return u.replace(/^wss:\/\/(broker\.)?/, '').replace(/[:/].*$/, '') + ' ' + diag.relays[u]; }).join(', ') || 'none yet';
+      el.textContent = 'Relay check · library: ' + diag.lib + ' · relays: ' + rel + ' · messages in: ' + diag.msgs + ' (room ' + diag.roomMsgs + ', sync ' + diag.syncs + ', unreadable ' + diag.bad + ') · sent: ' + diag.sent + (diag.errs.length ? ' · last error: ' + diag.errs[diag.errs.length - 1] : '');
+    }
+    S.env.showDiag = showDiag;
     function loadLib() {
-      if (window.mqtt && window.mqtt.connect) return Promise.resolve(window.mqtt);
+      if (window.mqtt && window.mqtt.connect) { diag.lib = 'ok'; return Promise.resolve(window.mqtt); }
       if (!S.env.mqttLibP) S.env.mqttLibP = new Promise(function (res, rej) {
         var i = 0;
         (function next() {
           if (window.mqtt && window.mqtt.connect) { res(window.mqtt); return; }
-          if (i >= MQTT_SRCS.length) { S.env.mqttLibP = null; rej(new Error('mqtt-lib')); return; }
+          if (i >= MQTT_SRCS.length) { S.env.mqttLibP = null; diag.lib = 'failed'; showDiag(); rej(new Error('mqtt-lib')); return; }
           var s = document.createElement('script');
           s.src = MQTT_SRCS[i++]; s.async = true;
-          s.onload = function () { (window.mqtt && window.mqtt.connect) ? res(window.mqtt) : next(); };
+          s.onload = function () { if (window.mqtt && window.mqtt.connect) { diag.lib = 'ok'; showDiag(); res(window.mqtt); } else next(); };
           s.onerror = next;
           document.head.appendChild(s);
         })();
@@ -2965,19 +2974,19 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
           var failed = 0, done = false;
           MQTT_BROKERS.forEach(function (url) {
             var c = mqtt.connect(url, { clientId: ('rs' + uid.replace(/[^a-z0-9]/gi, '').slice(-8) + Math.random().toString(36).slice(2, 10)).slice(0, 22), clean: true, keepalive: 30, connectTimeout: 8000, reconnectPeriod: 3000 });
-            var gaveUp = false;
+            var gaveUp = false; diag.relays[url] = 'connecting'; showDiag();
             var timer = setTimeout(function () { if (!c.connected && !gaveUp) { gaveUp = true; failed++; if (failed === MQTT_BROKERS.length && !done) { done = true; connP = null; netFail(); reject(new Error('no-broker')); } } }, 9000);
             c.on('connect', function () {
-              clearTimeout(timer);
+              clearTimeout(timer); diag.relays[url] = 'on'; showDiag();
               if (conns.indexOf(c) < 0) conns.push(c);
               netOk();
               Object.keys(subs).forEach(function (t) { c.subscribe(t, { qos: 1 }); });
               Object.keys(rooms).forEach(function (code) { requestSync(rooms[code], c); });
               if (!done) { done = true; resolve(true); }
             });
-            c.on('message', function (topic, payload) { onMessage(String(topic), payload); });
-            c.on('offline', function () { if (!live().length) netFail(); });
-            c.on('error', function () {});
+            c.on('message', function (topic, payload) { diag.msgs++; onMessage(String(topic), payload); showDiag(); });
+            c.on('offline', function () { diag.relays[url] = 'offline'; showDiag(); if (!live().length) netFail(); });
+            c.on('error', function (e) { diag.relays[url] = 'error'; diag.errs.push(String((e && e.message) || e).slice(0, 80)); showDiag(); });
           });
         });
       }, function (e) { connP = null; netFail(); throw e; });
@@ -2992,10 +3001,17 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       if (!rooms[code]) rooms[code] = { code: code, store: {}, listeners: [], ready: null, closeTimer: null, notifyQueued: false, lastMsg: 0, answered: {} };
       return rooms[code];
     }
+    var TD = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8') : null;
     function decode(payload) {
-      var txt = typeof payload === 'string' ? payload : (payload && payload.toString ? payload.toString() : '');
+      var txt = '';
+      try {
+        if (typeof payload === 'string') txt = payload;
+        else if (payload && TD && (payload instanceof Uint8Array || ArrayBuffer.isView(payload))) txt = TD.decode(payload);
+        else if (payload && TD && payload instanceof ArrayBuffer) txt = TD.decode(new Uint8Array(payload));
+        else if (payload && payload.toString) txt = payload.toString();
+      } catch (e) { txt = ''; }
       if (!txt) return undefined;
-      try { return JSON.parse(txt); } catch (e) { return undefined; }
+      try { return JSON.parse(txt); } catch (e) { diag.bad++; showDiag(); return null; }
     }
     function onMessage(topic, payload) {
       if (topic.indexOf(MQTT_ROOT) !== 0) return;
@@ -3005,11 +3021,12 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
         if (ix[2] === '_req') { answerIndex(ix[1]); return; }
         if (!/^[A-Z]{5}$/.test(ix[2])) return;
         var v0 = decode(payload);
-        if (S.env.pubIndex) { if (v0 === undefined) delete S.env.pubIndex[ix[2]]; else S.env.pubIndex[ix[2]] = v0; }
+        if (S.env.pubIndex && v0 !== null) { if (v0 === undefined) delete S.env.pubIndex[ix[2]]; else S.env.pubIndex[ix[2]] = v0; }
         return;
       }
       var p = parse(path); if (!p || !rooms[p.code]) return;
       var R = rooms[p.code], v = decode(payload);
+      if (p.rel.indexOf('_sync') === 0) diag.syncs++; else diag.roomMsgs++;
       if (p.rel === '_sync/req') { if (v && v.from !== myTag) answerSync(R, v.id); return; }
       if (p.rel === '_sync/state') {
         if (!v || !v.store) return;
@@ -3019,13 +3036,15 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
         if (added) { R.lastMsg = Date.now(); queueNotify(R); }
         return;
       }
+      if (v === null) return;
       R.lastMsg = Date.now();
       if (v === undefined) delete R.store[p.rel]; else R.store[p.rel] = v;
       queueNotify(R);
     }
     function sendRaw(path, body, retain, only) {
       var targets = only ? [only] : live();
-      targets.forEach(function (c) { try { c.publish(topicFor(path), body, { qos: 1, retain: !!retain }); } catch (e) {} });
+      targets.forEach(function (c) { try { c.publish(topicFor(path), body, { qos: 1, retain: !!retain }); diag.sent++; } catch (e) { diag.errs.push('send ' + String(e && e.message).slice(0, 60)); } });
+      showDiag();
     }
     function requestSync(R, only) {
       var id = Math.random().toString(36).slice(2, 10);
@@ -3097,7 +3116,8 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
         return new Promise(function (resolve, reject) {
           var left = cs.length, ok = false;
           cs.forEach(function (c) {
-            c.publish(topicFor(path), body, { qos: 1, retain: true }, function (err) { left--; if (!err && !ok) { ok = true; resolve(); } else if (!left && !ok) reject(err || new Error('pub')); });
+            diag.sent++;
+            c.publish(topicFor(path), body, { qos: 1, retain: true }, function (err) { if (err) diag.errs.push('publish ' + String(err.message || err).slice(0, 60)); left--; if (!err && !ok) { ok = true; resolve(); } else if (!left && !ok) reject(err || new Error('pub')); });
           });
         });
       });
@@ -3248,6 +3268,7 @@ T("colors","Colors","color","Which colors make the ultimate palette?",["Beauty",
       S.env.uid = webUid();
       S.env.db = makeWebDb(S.env.uid);
       S.env.orgHash = /^#organizer$/i.test(location.hash || '');
+      var nd = document.getElementById('net-diag'); if (nd) { nd.hidden = false; nd.textContent = 'Relay check · not connected yet (connects when you create or join a room)'; }
       applyWebCopy();
     }
     S.env.ready = true;
